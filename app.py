@@ -1,133 +1,175 @@
-from flask import Flask, render_template, Response
-import cv2
-import torch
-import torch.nn.functional as F
-import torchvision.transforms as transforms
-from PIL import Image
-import numpy as np
-import timm
-import sounddevice as sd
-import soundfile
-import tempfile
-import librosa
-import torch.nn as nn
-from sklearn.preprocessing import LabelEncoder
+from flask import Flask, render_template, request, redirect, session
+import pymysql.cursors
+import re
 import os
+from openpyxl import load_workbook
+from datetime import datetime
 
 app = Flask(__name__)
 
-class_names_video = ['anger', 'disgust', 'fear', 'happiness', 'neutral', 'sadness', 'surprise']
-class_names_audio = ['Fear', 'Pleasant_surprise', 'Sad', 'angry', 'disgust', 'happy', 'neutral','angry','disgust','fear','happy','neutral','pleasant_surprised','sad']
+# Generate a random secret key
+app.secret_key = os.urandom(24)
 
-# Load video emotion classification model
-model_video = timm.create_model('efficientnet_b2', pretrained=True)
-model_video.load_state_dict(torch.load('best_model_epoch_7.pt', map_location=torch.device('cpu')))
-model_video.eval()
+# MySQL configurations
+MYSQL_HOST = 'localhost'
+MYSQL_USER = 'root'
+MYSQL_PASSWORD = 'N108456'
+MYSQL_DB = 'login'
 
-# Load audio emotion classification model
-class CNN_LSTM(nn.Module):
-    def __init__(self, input_size, hidden_size, num_classes):
-        super(CNN_LSTM, self).__init__()
-        self.conv1 = nn.Conv1d(in_channels=1, out_channels=32, kernel_size=3)
-        self.conv2 = nn.Conv1d(in_channels=32, out_channels=64, kernel_size=3)
-        self.pool = nn.MaxPool1d(kernel_size=2)
-        self.dropout = nn.Dropout(0.25)
-        self.lstm1 = nn.LSTM(64, hidden_size, batch_first=True)
-        self.lstm2 = nn.LSTM(hidden_size, hidden_size, batch_first=True)
-        self.fc = nn.Linear(hidden_size, num_classes)
+# File to store login and logout details
+LOG_FILE = 'user_activity_logs.xlsx'
 
-    def forward(self, x):
-        x = x.unsqueeze(1)
-        x = self.pool(torch.relu(self.conv1(x)))
-        x = self.pool(torch.relu(self.conv2(x)))
-        x = x.permute(0, 2, 1)
-        x, _ = self.lstm1(x)
-        x, _ = self.lstm2(x)
-        x = x[:, -1, :]
-        x = self.dropout(x)
-        x = self.fc(x)
-        return x
+def get_db_connection():
+    return pymysql.connect(host=MYSQL_HOST,
+                           user=MYSQL_USER,
+                           password=MYSQL_PASSWORD,
+                           db=MYSQL_DB,
+                           charset='utf8mb4',
+                           cursorclass=pymysql.cursors.DictCursor)
 
-model_audio = CNN_LSTM(180, 32, 14)
-model_audio.load_state_dict(torch.load('speech_classification_model.pth'))
-model_audio.eval()
+def validate_password(password):
+    # Password should contain at least one capital alphabet, one number, one special character, and be more than 6 characters long
+    if len(password) < 6:
+        return False
+    if not re.search("[A-Z]", password):
+        return False
+    if not re.search("[0-9]", password):
+        return False
+    if not re.search("[!@#$%^&*()-_=+{};:,<.>?]", password):
+        return False
+    return True
 
-test_transform = transforms.Compose([
-    transforms.Resize(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])
+from openpyxl import Workbook, load_workbook
 
-def classify_emotion_video(frame):
-    frame_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    input_image = test_transform(frame_pil).unsqueeze(0)
-    with torch.no_grad():
-        output = model_video(input_image)
-    predicted_class = torch.argmax(output, dim=1).item()
-    predicted_class_name = class_names_video[predicted_class]
-    return predicted_class_name
+from datetime import timedelta
 
-def extract_features(file_path, mfcc, chroma, mel):
-    with soundfile.SoundFile(file_path) as sound_file:
-        X = sound_file.read(dtype="float32")
-        sample_rate = sound_file.samplerate
-        if chroma:
-            stft = np.abs(librosa.stft(X))
-        result = np.array([])
-        if mfcc:
-            mfccs = np.mean(librosa.feature.mfcc(y=X, sr=sample_rate, n_mfcc=40).T, axis=0)
-            result = np.hstack((result, mfccs))
-        if chroma:
-            chroma = np.mean(librosa.feature.chroma_stft(S=stft, sr=sample_rate).T, axis=0)
-            result = np.hstack((result, chroma))
-        if mel:
-            mel = np.mean(librosa.feature.melspectrogram(y=X, sr=sample_rate).T, axis=0)
-            result = np.hstack((result, mel))
-    return result
+def format_duration(duration):
+    # Format duration as hours:minutes:seconds
+    hours, remainder = divmod(duration.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
-def predict_emotion_audio(file_path):
-    features = extract_features(file_path, mfcc=True, chroma=True, mel=True)
-    features_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0)  # Add batch dimension
-    with torch.no_grad():
-        output = model_audio(features_tensor)
-        predicted_class = torch.argmax(output).item()
-    return class_names_audio[predicted_class]
+def log_activity(email, activity_type):
+    # Log activity (login/logout) time and duration in Excel file
+    if not os.path.exists(LOG_FILE):
+        wb = Workbook()
+        sheet = wb.active
+        sheet['A1'] = 'Email'
+        sheet['B1'] = 'Login Time'
+        sheet['C1'] = 'Logout Time'
+        sheet['D1'] = 'Duration'
+        wb.save(LOG_FILE)
+    
+    wb = load_workbook(LOG_FILE)
+    sheet = wb.active
+    next_row = sheet.max_row + 1
+    
+    if activity_type == 'Login':
+        # Log login time
+        sheet.cell(row=next_row, column=1).value = email
+        sheet.cell(row=next_row, column=2).value = datetime.now()
+    elif activity_type == 'Logout':
+        # Find the row with the matching email and log logout time
+        for row in range(1, next_row):
+            if sheet.cell(row=row, column=1).value == email and sheet.cell(row=row, column=3).value is None:
+                sheet.cell(row=row, column=3).value = datetime.now()
+                # Calculate duration
+                login_time = sheet.cell(row=row, column=2).value
+                logout_time = sheet.cell(row=row, column=3).value
+                duration = logout_time - login_time
+                formatted_duration = format_duration(duration)
+                sheet.cell(row=row, column=4).value = formatted_duration
+                break
+    
+    wb.save(LOG_FILE)
 
-def gen_frames():
-    cap = cv2.VideoCapture(0)
-    while True:
-        success, frame = cap.read()
-        if not success:
-            break
-        else:
-            predicted_class_video = classify_emotion_video(frame)
-            
-            # Capture audio
-            audio_file_path = os.path.join(tempfile.gettempdir(), "temp_audio.wav")
-            duration = 0.005 # 3 seconds
-            recording = sd.rec(int(duration * 44100), samplerate=44100, channels=1, dtype='float32')
-            sd.wait()
-            soundfile.write(audio_file_path, recording, samplerate=44100)
-
-            predicted_class_audio = predict_emotion_audio(audio_file_path)
-
-            cv2.putText(frame, f'Video Emotion: {predicted_class_video}', (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.putText(frame, f'Audio Emotion: {predicted_class_audio}', (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
-            
-            ret, buffer = cv2.imencode('.jpg', frame)
-            frame = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-
-
-
-@app.route('/')
+@app.route('/', methods=['GET', 'POST'])
 def index():
+    if request.method == 'POST':
+        if 'register' in request.form:
+            email = request.form['email']
+            username = request.form['username']
+            password = request.form['password']
+
+            if not email.endswith('@gmail.com') and not email.endswith('edu.in'):
+                return "Email should end with @gmail.com or edu.in"
+
+            if not validate_password(password):
+                return "Password should contain at least one capital alphabet, one number, one special character, and be more than 6 characters long."
+
+            try:
+                connection = get_db_connection()
+                with connection.cursor() as cursor:
+                    sql = "INSERT INTO users (email, username, password) VALUES (%s, %s, %s)"
+                    cursor.execute(sql, (email, username, password))
+                connection.commit()
+            finally:
+                connection.close()
+
+            return redirect('/')
+
+        elif 'login' in request.form:
+            username_email = request.form['username_email']
+            password = request.form['password']
+
+            try:
+                connection = get_db_connection()
+                with connection.cursor() as cursor:
+                    # Check if the username_email contains '@' to determine if it's an email
+                    if '@' in username_email:
+                        # If it contains '@', treat it as an email
+                        email = username_email
+                        sql = "SELECT * FROM users WHERE email = %s AND password = %s"
+                        cursor.execute(sql, (email, password))
+                    else:
+                        # Otherwise, treat it as a username
+                        username = username_email
+                        sql = "SELECT * FROM users WHERE username = %s AND password = %s"
+                        cursor.execute(sql, (username, password))
+                    user = cursor.fetchone()
+            finally:
+                connection.close()
+
+            if user:
+                session['loggedin'] = True
+                session['email'] = user['email']
+                log_activity(user['email'], 'Login')  # Log login time
+                return redirect('http://127.0.0.1:5001')  # Redirect to desired URL after login
+            else:
+                return "Invalid username or email or password"
+
     return render_template('index.html')
 
-@app.route('/webcam_feed')
-def webcam_feed():
-    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-if __name__ == "__main__":
-    app.run(debug=True, port=5001)
+@app.route('/dashboard')
+def dashboard():
+    if 'loggedin' in session:
+        email = session['email']
+        try:
+            connection = get_db_connection()
+            with connection.cursor() as cursor:
+                sql = "SELECT username FROM users WHERE email = %s"
+                cursor.execute(sql, (email,))
+                user = cursor.fetchone()
+        finally:
+            connection.close()
+
+        if user:
+            username = user['username']
+            return render_template('dashboard.html', username=username)
+        else:
+            return "User not found"
+    return redirect('/')
+
+
+
+@app.route('/logout')
+def logout():
+    if 'loggedin' in session:
+        log_activity(session['email'], 'Logout')  # Log logout time
+        session.clear()
+    return redirect('/')
+
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)  # Run the app on port 5001
