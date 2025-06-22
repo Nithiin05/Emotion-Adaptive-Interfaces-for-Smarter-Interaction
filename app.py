@@ -13,7 +13,7 @@ app.secret_key = os.urandom(24)
 # MySQL configurations
 MYSQL_HOST = 'localhost'
 MYSQL_USER = 'root'
-MYSQL_PASSWORD = 'N108456'
+MYSQL_PASSWORD = ''
 MYSQL_DB = 'login'
 
 # File to store login and logout details
